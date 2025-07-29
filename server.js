@@ -22,37 +22,105 @@ if (!fs.existsSync(downloadsDir)) {
     fs.mkdirSync(downloadsDir);
 }
 
+// Enhanced agent configuration to avoid detection
+const getRequestOptions = () => ({
+    headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    }
+});
+
 // Utility function to sanitize filename
 const sanitizeFilename = (filename) => {
     return filename.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_');
 };
 
-// Get video info endpoint
+// Enhanced error handling wrapper
+const handleYtdlError = (error) => {
+    console.error('YTDL Error Details:', {
+        message: error.message,
+        stack: error.stack,
+        statusCode: error.statusCode
+    });
+    
+    if (error.message.includes('<!DOCTYPE')) {
+        return {
+            error: 'YouTube access blocked or rate limited. Please try again later.',
+            details: 'The request was blocked by YouTube. This often happens due to rate limiting or bot detection.'
+        };
+    }
+    
+    if (error.message.includes('Video unavailable')) {
+        return {
+            error: 'Video is unavailable or private',
+            details: 'The video may be private, deleted, or region-restricted.'
+        };
+    }
+    
+    if (error.message.includes('Sign in to confirm')) {
+        return {
+            error: 'Age-restricted content',
+            details: 'This video requires age verification and cannot be downloaded.'
+        };
+    }
+    
+    return {
+        error: 'Failed to process YouTube video',
+        details: error.message
+    };
+};
+
+// Enhanced video info endpoint with better error handling
 app.post('/api/video-info', async (req, res) => {
     try {
         const { url } = req.body;
         
         console.log('Received URL:', url);
         
+        if (!url) {
+            return res.status(400).json({ error: 'URL is required' });
+        }
+        
         if (!ytdl.validateURL(url)) {
-            return res.status(400).json({ error: 'Invalid YouTube URL' });
+            return res.status(400).json({ error: 'Invalid YouTube URL format' });
         }
 
         console.log('Getting video info...');
-        const info = await ytdl.getInfo(url, {
-            requestOptions: {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }
-            }
-        });
+        
+        // Add timeout and retry logic
+        const info = await Promise.race([
+            ytdl.getInfo(url, {
+                requestOptions: getRequestOptions()
+            }),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Request timeout')), 30000)
+            )
+        ]);
         
         const videoDetails = info.videoDetails;
         console.log('Video title:', videoDetails.title);
         
-        // Get all formats
-        const allFormats = info.formats;
-        console.log('Total formats found:', allFormats.length);
+        // Validate that we got proper video details
+        if (!videoDetails || !videoDetails.title) {
+            throw new Error('Invalid video data received');
+        }
+        
+        // Get all formats with enhanced filtering
+        const allFormats = info.formats.filter(format => {
+            // Filter out formats without proper URLs or content length
+            return format.url && (format.contentLength || format.approxDurationMs);
+        });
+        
+        console.log('Valid formats found:', allFormats.length);
+        
+        if (allFormats.length === 0) {
+            throw new Error('No downloadable formats found for this video');
+        }
         
         // Debug: Log format details
         allFormats.forEach((format, index) => {
@@ -64,23 +132,24 @@ app.post('/api/video-info', async (req, res) => {
                 hasVideo: format.hasVideo,
                 hasAudio: format.hasAudio,
                 audioBitrate: format.audioBitrate,
-                container: format.container
+                container: format.container,
+                hasUrl: !!format.url
             });
         });
         
         // Filter video formats with audio
         const videoWithAudioFormats = allFormats.filter(f => 
-            f.hasVideo && f.hasAudio && f.height
+            f.hasVideo && f.hasAudio && f.height && f.url
         );
         
         // Filter video-only formats
         const videoOnlyFormats = allFormats.filter(f => 
-            f.hasVideo && !f.hasAudio && f.height
+            f.hasVideo && !f.hasAudio && f.height && f.url
         );
         
         // Filter audio-only formats
         const audioOnlyFormats = allFormats.filter(f => 
-            !f.hasVideo && f.hasAudio && f.audioBitrate
+            !f.hasVideo && f.hasAudio && f.audioBitrate && f.url
         );
         
         console.log('Video+Audio formats:', videoWithAudioFormats.length);
@@ -105,14 +174,19 @@ app.post('/api/video-info', async (req, res) => {
         console.log('Available video qualities:', videoQualities);
         console.log('Available audio qualities:', audioQualities);
 
+        // Ensure we have at least some formats available
+        if (videoQualities.length === 0 && audioQualities.length === 0) {
+            throw new Error('No valid download formats available for this video');
+        }
+
         res.json({
             title: videoDetails.title,
-            author: videoDetails.author.name,
+            author: videoDetails.author?.name || 'Unknown',
             duration: videoDetails.lengthSeconds,
             viewCount: videoDetails.viewCount,
             publishDate: videoDetails.publishDate,
-            description: videoDetails.description?.substring(0, 200) + '...',
-            thumbnail: videoDetails.thumbnails[videoDetails.thumbnails.length - 1].url,
+            description: videoDetails.description?.substring(0, 200) + '...' || 'No description available',
+            thumbnail: videoDetails.thumbnails?.[videoDetails.thumbnails.length - 1]?.url || '',
             availableQualities: {
                 video: videoQualities,
                 audio: audioQualities
@@ -121,74 +195,36 @@ app.post('/api/video-info', async (req, res) => {
 
     } catch (error) {
         console.error('Error getting video info:', error);
-        console.error('Error details:', error.message);
-        console.error('Error stack:', error.stack);
-        res.status(500).json({ 
-            error: 'Failed to get video information',
-            details: error.message 
-        });
+        const errorResponse = handleYtdlError(error);
+        res.status(500).json(errorResponse);
     }
 });
 
-// Debug formats endpoint
-app.post('/api/debug-formats', async (req, res) => {
-    try {
-        const { url } = req.body;
-        
-        if (!ytdl.validateURL(url)) {
-            return res.status(400).json({ error: 'Invalid YouTube URL' });
-        }
-
-        const info = await ytdl.getInfo(url);
-        const videoDetails = info.videoDetails;
-        
-        // Get all available formats with detailed information
-        const allFormats = info.formats.map(format => ({
-            itag: format.itag,
-            container: format.container,
-            quality: format.quality,
-            qualityLabel: format.qualityLabel,
-            height: format.height,
-            width: format.width,
-            fps: format.fps,
-            hasVideo: format.hasVideo,
-            hasAudio: format.hasAudio,
-            audioBitrate: format.audioBitrate,
-            audioSampleRate: format.audioSampleRate,
-            contentLength: format.contentLength,
-            url: format.url ? 'Available' : 'Unavailable'
-        }));
-
-        res.json({
-            title: videoDetails.title,
-            totalFormats: allFormats.length,
-            formats: allFormats
-        });
-
-    } catch (error) {
-        console.error('Error getting debug info:', error);
-        res.status(500).json({ error: 'Failed to get debug information' });
-    }
-});
-
-// Download endpoint
+// Enhanced download endpoint
 app.post('/api/download', async (req, res) => {
     try {
         const { url, format, quality } = req.body;
         
         console.log('Download request:', { url, format, quality });
         
+        if (!url || !format) {
+            return res.status(400).json({ error: 'URL and format are required' });
+        }
+        
         if (!ytdl.validateURL(url)) {
-            return res.status(400).json({ error: 'Invalid YouTube URL' });
+            return res.status(400).json({ error: 'Invalid YouTube URL format' });
         }
 
-        const info = await ytdl.getInfo(url, {
-            requestOptions: {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }
-            }
-        });
+        // Add timeout to getInfo request
+        const info = await Promise.race([
+            ytdl.getInfo(url, {
+                requestOptions: getRequestOptions()
+            }),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Request timeout while getting video info')), 30000)
+            )
+        ]);
+        
         const title = sanitizeFilename(info.videoDetails.title);
         
         console.log('Starting download for:', title);
@@ -201,17 +237,14 @@ app.post('/api/download', async (req, res) => {
 
     } catch (error) {
         console.error('Download error:', error);
-        console.error('Error details:', error.message);
         if (!res.headersSent) {
-            res.status(500).json({ 
-                error: 'Download failed',
-                details: error.message 
-            });
+            const errorResponse = handleYtdlError(error);
+            res.status(500).json(errorResponse);
         }
     }
 });
 
-// MP3 Download function
+// Enhanced MP3 Download function
 async function downloadMP3(url, title, quality, res, info) {
     const filename = `${title}.mp3`;
     const filepath = path.join(downloadsDir, filename);
@@ -219,33 +252,39 @@ async function downloadMP3(url, title, quality, res, info) {
     try {
         console.log('Starting MP3 download...');
         
-        // Get the best audio format
+        // Get the best audio format with enhanced filtering
         const audioFormats = info.formats.filter(f => 
-            !f.hasVideo && f.hasAudio && f.audioBitrate && f.contentLength
+            !f.hasVideo && f.hasAudio && f.audioBitrate && f.url && (f.contentLength || f.approxDurationMs)
         );
         
         console.log('Available audio formats for MP3:', audioFormats.map(f => ({
             audioBitrate: f.audioBitrate,
             audioSampleRate: f.audioSampleRate,
             itag: f.itag,
-            container: f.container
+            container: f.container,
+            hasUrl: !!f.url
         })));
         
         if (audioFormats.length === 0) {
-            throw new Error('No audio-only formats available');
+            throw new Error('No suitable audio-only formats available for this video');
         }
         
         // Select the best audio format
         const bestAudioFormat = audioFormats.sort((a, b) => b.audioBitrate - a.audioBitrate)[0];
         console.log('Selected audio format:', bestAudioFormat.itag, bestAudioFormat.audioBitrate + 'kbps');
         
-        // Get audio stream with specific format
+        // Get audio stream with enhanced options
         const audioStream = ytdl(url, {
             format: bestAudioFormat,
-            requestOptions: {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }
+            requestOptions: getRequestOptions(),
+            highWaterMark: 1 << 25 // Increase buffer size
+        });
+
+        // Add error handling for the stream
+        audioStream.on('error', (error) => {
+            console.error('Audio stream error:', error);
+            if (!res.headersSent) {
+                res.status(500).json(handleYtdlError(error));
             }
         });
 
@@ -257,10 +296,11 @@ async function downloadMP3(url, title, quality, res, info) {
 
         console.log('Converting to MP3 with bitrate:', bitrate);
 
-        // Convert to MP3 using ffmpeg
+        // Convert to MP3 using ffmpeg with timeout
         const ffmpegProcess = ffmpeg(audioStream)
             .audioBitrate(bitrate)
             .format('mp3')
+            .audioCodec('libmp3lame')
             .on('start', (commandLine) => {
                 console.log('FFmpeg started with command:', commandLine);
             })
@@ -269,34 +309,47 @@ async function downloadMP3(url, title, quality, res, info) {
             })
             .save(filepath);
 
+        // Add timeout to ffmpeg process
+        const timeout = setTimeout(() => {
+            ffmpegProcess.kill('SIGKILL');
+            if (!res.headersSent) {
+                res.status(500).json({ error: 'MP3 conversion timeout' });
+            }
+        }, 300000); // 5 minutes timeout
+
         ffmpegProcess.on('end', () => {
+            clearTimeout(timeout);
             console.log('MP3 conversion completed');
-            res.json({
-                success: true,
-                filename: filename,
-                downloadUrl: `/downloads/${filename}`,
-                message: 'MP3 download completed successfully!'
-            });
+            if (!res.headersSent) {
+                res.json({
+                    success: true,
+                    filename: filename,
+                    downloadUrl: `/downloads/${filename}`,
+                    message: 'MP3 download completed successfully!'
+                });
+            }
         });
 
         ffmpegProcess.on('error', (error) => {
+            clearTimeout(timeout);
             console.error('FFmpeg error:', error);
-            res.status(500).json({ 
-                error: 'Failed to convert to MP3',
-                details: error.message 
-            });
+            if (!res.headersSent) {
+                res.status(500).json({ 
+                    error: 'Failed to convert to MP3',
+                    details: error.message 
+                });
+            }
         });
 
     } catch (error) {
         console.error('MP3 download error:', error);
-        res.status(500).json({ 
-            error: 'MP3 download failed',
-            details: error.message 
-        });
+        if (!res.headersSent) {
+            res.status(500).json(handleYtdlError(error));
+        }
     }
 }
 
-// MP4 Download function
+// Enhanced MP4 Download function
 async function downloadMP4(url, title, quality, res, info) {
     const filename = `${title}.mp4`;
     const filepath = path.join(downloadsDir, filename);
@@ -312,13 +365,17 @@ async function downloadMP4(url, title, quality, res, info) {
             console.log('Target height:', targetHeight);
         }
 
-        // Get available formats
-        const allFormats = info.formats;
-        console.log('Total formats available:', allFormats.length);
+        // Get available formats with enhanced filtering
+        const allFormats = info.formats.filter(f => f.url && (f.contentLength || f.approxDurationMs));
+        console.log('Total valid formats available:', allFormats.length);
+        
+        if (allFormats.length === 0) {
+            throw new Error('No valid formats available for download');
+        }
         
         // Filter formats that have both video and audio
         const videoWithAudioFormats = allFormats.filter(f => 
-            f.hasVideo && f.hasAudio && f.height && f.contentLength
+            f.hasVideo && f.hasAudio && f.height
         );
         
         console.log('Available video+audio formats:', videoWithAudioFormats.map(f => ({
@@ -326,7 +383,8 @@ async function downloadMP4(url, title, quality, res, info) {
             quality: f.quality,
             qualityLabel: f.qualityLabel,
             itag: f.itag,
-            container: f.container
+            container: f.container,
+            hasUrl: !!f.url
         })));
         
         // First, try to find a format with both video and audio
@@ -359,23 +417,35 @@ async function downloadMP4(url, title, quality, res, info) {
             try {
                 const videoStream = ytdl(url, {
                     format: selectedFormat,
-                    requestOptions: {
-                        headers: {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                        }
-                    }
+                    requestOptions: getRequestOptions(),
+                    highWaterMark: 1 << 25
+                });
+
+                // Add error handling for the stream
+                videoStream.on('error', (error) => {
+                    console.error('Video stream error:', error);
+                    throw error;
                 });
 
                 const writeStream = fs.createWriteStream(filepath);
-                await pipeline(videoStream, writeStream);
+                
+                // Add timeout to pipeline
+                await Promise.race([
+                    pipeline(videoStream, writeStream),
+                    new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Download timeout')), 600000) // 10 minutes
+                    )
+                ]);
 
                 console.log('Single stream download completed');
-                res.json({
-                    success: true,
-                    filename: filename,
-                    downloadUrl: `/downloads/${filename}`,
-                    message: `MP4 download completed successfully at ${selectedFormat.height}p!`
-                });
+                if (!res.headersSent) {
+                    res.json({
+                        success: true,
+                        filename: filename,
+                        downloadUrl: `/downloads/${filename}`,
+                        message: `MP4 download completed successfully at ${selectedFormat.height}p!`
+                    });
+                }
             } catch (streamError) {
                 console.error('Stream download failed:', streamError.message);
                 console.log('Falling back to merge method...');
@@ -389,14 +459,13 @@ async function downloadMP4(url, title, quality, res, info) {
 
     } catch (error) {
         console.error('MP4 download error:', error);
-        res.status(500).json({ 
-            error: 'MP4 download failed',
-            details: error.message 
-        });
+        if (!res.headersSent) {
+            res.status(500).json(handleYtdlError(error));
+        }
     }
 }
 
-// Download and merge MP4 (for higher quality videos)
+// Enhanced download and merge MP4 function
 async function downloadAndMergeMP4(url, title, quality, res, info) {
     const filename = `${title}.mp4`;
     const filepath = path.join(downloadsDir, filename);
@@ -412,10 +481,10 @@ async function downloadAndMergeMP4(url, title, quality, res, info) {
             targetHeight = parseInt(quality.replace('p', ''));
         }
 
-        // Select video format
+        // Select video format with enhanced filtering
         let videoFormat;
         const videoOnlyFormats = info.formats.filter(f => 
-            f.hasVideo && !f.hasAudio && f.height && f.contentLength
+            f.hasVideo && !f.hasAudio && f.height && f.url && (f.contentLength || f.approxDurationMs)
         );
         
         console.log('Available video-only formats:', videoOnlyFormats.map(f => ({
@@ -423,7 +492,8 @@ async function downloadAndMergeMP4(url, title, quality, res, info) {
             quality: f.quality,
             qualityLabel: f.qualityLabel,
             itag: f.itag,
-            container: f.container
+            container: f.container,
+            hasUrl: !!f.url
         })));
         
         if (targetHeight) {
@@ -442,16 +512,17 @@ async function downloadAndMergeMP4(url, title, quality, res, info) {
             videoFormat = videoOnlyFormats.sort((a, b) => b.height - a.height)[0];
         }
 
-        // Select audio format
+        // Select audio format with enhanced filtering
         const audioOnlyFormats = info.formats.filter(f => 
-            !f.hasVideo && f.hasAudio && f.audioBitrate && f.contentLength
+            !f.hasVideo && f.hasAudio && f.audioBitrate && f.url && (f.contentLength || f.approxDurationMs)
         );
         
         console.log('Available audio-only formats:', audioOnlyFormats.map(f => ({
             audioBitrate: f.audioBitrate,
             audioSampleRate: f.audioSampleRate,
             itag: f.itag,
-            container: f.container
+            container: f.container,
+            hasUrl: !!f.url
         })));
         
         const audioFormat = audioOnlyFormats.sort((a, b) => b.audioBitrate - a.audioBitrate)[0];
@@ -462,35 +533,41 @@ async function downloadAndMergeMP4(url, title, quality, res, info) {
 
         console.log(`Selected formats - Video: ${videoFormat.height}p (itag: ${videoFormat.itag}), Audio: ${audioFormat.audioBitrate}kbps (itag: ${audioFormat.itag})`);
 
-        // Download video stream
+        // Download video stream with timeout
         console.log('Downloading video stream...');
         const videoStream = ytdl(url, { 
             format: videoFormat,
-            requestOptions: {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }
-            }
+            requestOptions: getRequestOptions(),
+            highWaterMark: 1 << 25
         });
-        await pipeline(videoStream, fs.createWriteStream(tempVideoPath));
+        
+        await Promise.race([
+            pipeline(videoStream, fs.createWriteStream(tempVideoPath)),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Video download timeout')), 600000)
+            )
+        ]);
         console.log('Video stream downloaded');
         
-        // Download audio stream
+        // Download audio stream with timeout
         console.log('Downloading audio stream...');
         const audioStream = ytdl(url, { 
             format: audioFormat,
-            requestOptions: {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }
-            }
+            requestOptions: getRequestOptions(),
+            highWaterMark: 1 << 25
         });
-        await pipeline(audioStream, fs.createWriteStream(tempAudioPath));
+        
+        await Promise.race([
+            pipeline(audioStream, fs.createWriteStream(tempAudioPath)),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Audio download timeout')), 600000)
+            )
+        ]);
         console.log('Audio stream downloaded');
 
-        // Merge using ffmpeg
+        // Merge using ffmpeg with timeout
         console.log('Starting merge with ffmpeg...');
-        ffmpeg()
+        const ffmpegProcess = ffmpeg()
             .input(tempVideoPath)
             .input(tempAudioPath)
             .videoCodec('copy')
@@ -501,46 +578,71 @@ async function downloadAndMergeMP4(url, title, quality, res, info) {
             .on('progress', (progress) => {
                 console.log('Merging progress: ' + progress.percent + '% done');
             })
-            .save(filepath)
-            .on('end', () => {
-                console.log('Merge completed successfully');
-                // Clean up temp files
+            .save(filepath);
+
+        // Add timeout to ffmpeg process
+        const timeout = setTimeout(() => {
+            ffmpegProcess.kill('SIGKILL');
+            cleanupTempFiles();
+            if (!res.headersSent) {
+                res.status(500).json({ error: 'Merge process timeout' });
+            }
+        }, 300000); // 5 minutes timeout
+
+        const cleanupTempFiles = () => {
+            try {
                 if (fs.existsSync(tempVideoPath)) fs.unlinkSync(tempVideoPath);
                 if (fs.existsSync(tempAudioPath)) fs.unlinkSync(tempAudioPath);
+            } catch (cleanupError) {
+                console.error('Error cleaning up temp files:', cleanupError);
+            }
+        };
+
+        ffmpegProcess
+            .on('end', () => {
+                clearTimeout(timeout);
+                console.log('Merge completed successfully');
+                cleanupTempFiles();
                 
-                res.json({
-                    success: true,
-                    filename: filename,
-                    downloadUrl: `/downloads/${filename}`,
-                    message: `MP4 download completed successfully at ${videoFormat.height}p!`
-                });
+                if (!res.headersSent) {
+                    res.json({
+                        success: true,
+                        filename: filename,
+                        downloadUrl: `/downloads/${filename}`,
+                        message: `MP4 download completed successfully at ${videoFormat.height}p!`
+                    });
+                }
             })
             .on('error', (error) => {
+                clearTimeout(timeout);
                 console.error('Merge error:', error);
-                // Clean up temp files
-                if (fs.existsSync(tempVideoPath)) fs.unlinkSync(tempVideoPath);
-                if (fs.existsSync(tempAudioPath)) fs.unlinkSync(tempAudioPath);
+                cleanupTempFiles();
                 
-                res.status(500).json({ 
-                    error: 'Failed to merge video and audio',
-                    details: error.message 
-                });
+                if (!res.headersSent) {
+                    res.status(500).json({ 
+                        error: 'Failed to merge video and audio',
+                        details: error.message 
+                    });
+                }
             });
 
     } catch (error) {
         console.error('Download and merge error:', error);
         // Clean up temp files
-        if (fs.existsSync(tempVideoPath)) fs.unlinkSync(tempVideoPath);
-        if (fs.existsSync(tempAudioPath)) fs.unlinkSync(tempAudioPath);
+        try {
+            if (fs.existsSync(tempVideoPath)) fs.unlinkSync(tempVideoPath);
+            if (fs.existsSync(tempAudioPath)) fs.unlinkSync(tempAudioPath);
+        } catch (cleanupError) {
+            console.error('Error cleaning up temp files:', cleanupError);
+        }
         
-        res.status(500).json({ 
-            error: 'Download and merge failed',
-            details: error.message 
-        });
+        if (!res.headersSent) {
+            res.status(500).json(handleYtdlError(error));
+        }
     }
 }
 
-// Debug endpoint to see all available formats
+// Enhanced debug endpoint
 app.post('/api/debug-formats', async (req, res) => {
     try {
         const { url } = req.body;
@@ -549,13 +651,14 @@ app.post('/api/debug-formats', async (req, res) => {
             return res.status(400).json({ error: 'Invalid YouTube URL' });
         }
 
-        const info = await ytdl.getInfo(url, {
-            requestOptions: {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }
-            }
-        });
+        const info = await Promise.race([
+            ytdl.getInfo(url, {
+                requestOptions: getRequestOptions()
+            }),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Request timeout')), 30000)
+            )
+        ]);
         
         const formats = info.formats.map(f => ({
             itag: f.itag,
@@ -570,42 +673,70 @@ app.post('/api/debug-formats', async (req, res) => {
             audioBitrate: f.audioBitrate,
             audioSampleRate: f.audioSampleRate,
             contentLength: f.contentLength,
-            mimeType: f.mimeType
+            mimeType: f.mimeType,
+            hasUrl: !!f.url
         }));
 
         res.json({
             title: info.videoDetails.title,
             totalFormats: formats.length,
+            validFormats: formats.filter(f => f.hasUrl).length,
             formats: formats
         });
 
     } catch (error) {
         console.error('Debug formats error:', error);
-        res.status(500).json({ 
-            error: 'Failed to get format information',
-            details: error.message 
+        res.status(500).json(handleYtdlError(error));
+    }
+});
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+    res.json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        downloadsDir: downloadsDir
+    });
+});
+
+// Enhanced cleanup with error handling
+setInterval(() => {
+    try {
+        const files = fs.readdirSync(downloadsDir);
+        const now = Date.now();
+        const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+
+        files.forEach(file => {
+            try {
+                const filePath = path.join(downloadsDir, file);
+                const stats = fs.statSync(filePath);
+                
+                if (now - stats.mtime.getTime() > maxAge) {
+                    fs.unlinkSync(filePath);
+                    console.log(`Cleaned up old file: ${file}`);
+                }
+            } catch (fileError) {
+                console.error(`Error processing file ${file}:`, fileError);
+            }
+        });
+    } catch (error) {
+        console.error('Error during cleanup:', error);
+    }
+}, 60 * 60 * 1000); // Run every hour
+
+// Global error handler
+app.use((error, req, res, next) => {
+    console.error('Global error handler:', error);
+    if (!res.headersSent) {
+        res.status(500).json({
+            error: 'Internal server error',
+            details: error.message
         });
     }
 });
 
-// Clean up old files periodically (optional)
-setInterval(() => {
-    const files = fs.readdirSync(downloadsDir);
-    const now = Date.now();
-    const maxAge = 24 * 60 * 60 * 1000; // 24 hours
-
-    files.forEach(file => {
-        const filePath = path.join(downloadsDir, file);
-        const stats = fs.statSync(filePath);
-        
-        if (now - stats.mtime.getTime() > maxAge) {
-            fs.unlinkSync(filePath);
-            console.log(`Cleaned up old file: ${file}`);
-        }
-    });
-}, 60 * 60 * 1000); // Run every hour
-
 app.listen(PORT, () => {
     console.log(`YouTube Downloader server running on port ${PORT}`);
     console.log(`Downloads will be saved to: ${downloadsDir}`);
+    console.log('Health check available at: /api/health');
 });
