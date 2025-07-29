@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const ytdl = require('@distube/ytdl-core');
+const ytdlFallback = require('ytdl-core');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const path = require('path');
@@ -83,6 +84,17 @@ const formatFileSize = (bytes) => {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 };
 
+// Helper function to get video info with fallback
+const getVideoInfoWithFallback = async (url, options) => {
+    try {
+        return await ytdl.getInfo(url, options);
+    } catch (error) {
+        console.log('Primary ytdl failed, trying fallback:', error.message);
+        // Try with fallback library (simpler options)
+        return await ytdlFallback.getInfo(url);
+    }
+};
+
 // Get video info endpoint
 app.post('/api/video-info', async (req, res) => {
     try {
@@ -107,19 +119,25 @@ app.post('/api/video-info', async (req, res) => {
                     requestOptions: {
                         headers: {
                             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                            'Accept-Language': 'en-US,en;q=0.5',
-                            'Accept-Encoding': 'gzip, deflate',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'Accept-Encoding': 'gzip, deflate, br',
                             'DNT': '1',
                             'Connection': 'keep-alive',
-                            'Upgrade-Insecure-Requests': '1'
+                            'Upgrade-Insecure-Requests': '1',
+                            'Sec-Fetch-Dest': 'document',
+                            'Sec-Fetch-Mode': 'navigate',
+                            'Sec-Fetch-Site': 'none',
+                            'Cache-Control': 'max-age=0'
                         },
                         transform: (parsed) => {
                             parsed.rejectUnauthorized = false;
                             return parsed;
                         }
                     },
-                    agent: false
+                    agent: false,
+                    lang: 'en',
+                    format: 'html5'
                 });
                 break; // Success, exit retry loop
             } catch (error) {
@@ -127,14 +145,32 @@ app.post('/api/video-info', async (req, res) => {
                 console.log(`Attempt ${attempts} failed:`, error.message);
                 
                 if (attempts >= maxAttempts) {
-                    // If all retries failed, check if it's a specific error
-                    if (error.message.includes('Video unavailable')) {
-                        return res.status(400).json({ 
-                            error: 'This video is not available for download. It may be private, age-restricted, or region-blocked.',
-                            details: 'Please try with a different video URL.'
-                        });
+                    // Try fallback with regular ytdl-core
+                    console.log('Trying fallback with ytdl-core...');
+                    try {
+                        info = await ytdlFallback.getInfo(url);
+                        console.log('Fallback successful!');
+                        break;
+                    } catch (fallbackError) {
+                        console.log('Fallback also failed:', fallbackError.message);
+                        
+                        // If all retries failed, check if it's a specific error
+                        if (error.message.includes('Video unavailable') || fallbackError.message.includes('Video unavailable')) {
+                            return res.status(400).json({ 
+                                error: 'This video is not available for download. It may be private, age-restricted, or region-blocked.',
+                                details: 'Please try with a different video URL.'
+                            });
+                        }
+                        
+                        if (error.message.includes('parsing watch.html') || fallbackError.message.includes('parsing')) {
+                            return res.status(503).json({ 
+                                error: 'YouTube has made changes that temporarily prevent downloads. Please try again later.',
+                                details: 'This is a temporary issue that should be resolved soon.'
+                            });
+                        }
+                        
+                        throw error; // Re-throw other errors
                     }
-                    throw error; // Re-throw other errors
                 }
                 
                 // Wait before retry
@@ -234,23 +270,29 @@ app.post('/api/debug-formats', async (req, res) => {
             return res.status(400).json({ error: 'Invalid YouTube URL' });
         }
 
-        const info = await ytdl.getInfo(url, {
+        const info = await getVideoInfoWithFallback(url, {
             requestOptions: {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                    'Accept-Encoding': 'gzip, deflate',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
                     'DNT': '1',
                     'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1'
+                    'Upgrade-Insecure-Requests': '1',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Cache-Control': 'max-age=0'
                 },
                 transform: (parsed) => {
                     parsed.rejectUnauthorized = false;
                     return parsed;
                 }
             },
-            agent: false
+            agent: false,
+            lang: 'en',
+            format: 'html5'
         });
         const videoDetails = info.videoDetails;
         
@@ -294,23 +336,29 @@ app.post('/api/download', async (req, res) => {
             return res.status(400).json({ error: 'Invalid YouTube URL' });
         }
 
-        const info = await ytdl.getInfo(url, {
+        const info = await getVideoInfoWithFallback(url, {
             requestOptions: {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                    'Accept-Encoding': 'gzip, deflate',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
                     'DNT': '1',
                     'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1'
+                    'Upgrade-Insecure-Requests': '1',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Cache-Control': 'max-age=0'
                 },
                 transform: (parsed) => {
                     parsed.rejectUnauthorized = false;
                     return parsed;
                 }
             },
-            agent: false
+            agent: false,
+            lang: 'en',
+            format: 'html5'
         });
         const title = sanitizeFilename(info.videoDetails.title);
         
@@ -684,10 +732,10 @@ app.post('/api/debug-formats', async (req, res) => {
             return res.status(400).json({ error: 'Invalid YouTube URL' });
         }
 
-        const info = await ytdl.getInfo(url, {
+        const info = await getVideoInfoWithFallback(url, {
             requestOptions: {
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 }
             }
         });
