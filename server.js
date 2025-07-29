@@ -8,6 +8,9 @@ const { promisify } = require('util');
 const stream = require('stream');
 const pipeline = promisify(stream.pipeline);
 
+// Set environment variable to disable update check
+process.env.YTDL_NO_UPDATE = '1';
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -92,13 +95,52 @@ app.post('/api/video-info', async (req, res) => {
         }
 
         console.log('Getting video info...');
-        const info = await ytdl.getInfo(url, {
-            requestOptions: {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        
+        // Retry mechanism for getting video info
+        let info;
+        let attempts = 0;
+        const maxAttempts = 3;
+        
+        while (attempts < maxAttempts) {
+            try {
+                info = await ytdl.getInfo(url, {
+                    requestOptions: {
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.5',
+                            'Accept-Encoding': 'gzip, deflate',
+                            'DNT': '1',
+                            'Connection': 'keep-alive',
+                            'Upgrade-Insecure-Requests': '1'
+                        },
+                        transform: (parsed) => {
+                            parsed.rejectUnauthorized = false;
+                            return parsed;
+                        }
+                    },
+                    agent: false
+                });
+                break; // Success, exit retry loop
+            } catch (error) {
+                attempts++;
+                console.log(`Attempt ${attempts} failed:`, error.message);
+                
+                if (attempts >= maxAttempts) {
+                    // If all retries failed, check if it's a specific error
+                    if (error.message.includes('Video unavailable')) {
+                        return res.status(400).json({ 
+                            error: 'This video is not available for download. It may be private, age-restricted, or region-blocked.',
+                            details: 'Please try with a different video URL.'
+                        });
+                    }
+                    throw error; // Re-throw other errors
                 }
+                
+                // Wait before retry
+                await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
             }
-        });
+        }
         
         const videoDetails = info.videoDetails;
         console.log('Video title:', videoDetails.title);
@@ -192,7 +234,24 @@ app.post('/api/debug-formats', async (req, res) => {
             return res.status(400).json({ error: 'Invalid YouTube URL' });
         }
 
-        const info = await ytdl.getInfo(url);
+        const info = await ytdl.getInfo(url, {
+            requestOptions: {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                },
+                transform: (parsed) => {
+                    parsed.rejectUnauthorized = false;
+                    return parsed;
+                }
+            },
+            agent: false
+        });
         const videoDetails = info.videoDetails;
         
         // Get all available formats with detailed information
@@ -238,9 +297,20 @@ app.post('/api/download', async (req, res) => {
         const info = await ytdl.getInfo(url, {
             requestOptions: {
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                },
+                transform: (parsed) => {
+                    parsed.rejectUnauthorized = false;
+                    return parsed;
                 }
-            }
+            },
+            agent: false
         });
         const title = sanitizeFilename(info.videoDetails.title);
         
@@ -297,7 +367,7 @@ async function downloadMP3(url, title, quality, res, info) {
             format: bestAudioFormat,
             requestOptions: {
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 }
             }
         });
@@ -418,7 +488,7 @@ async function downloadMP4(url, title, quality, res, info) {
                     format: selectedFormat,
                     requestOptions: {
                         headers: {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                         }
                     }
                 });
@@ -529,7 +599,7 @@ async function downloadAndMergeMP4(url, title, quality, res, info) {
             format: videoFormat,
             requestOptions: {
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 }
             }
         });
@@ -542,7 +612,7 @@ async function downloadAndMergeMP4(url, title, quality, res, info) {
             format: audioFormat,
             requestOptions: {
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 }
             }
         });
