@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors({
-    origin: 'http://localhost:3000', // Allow frontend origin
+    origin: ['http://localhost:3000', 'https://ytdownkb.onrender.com', /\.vercel\.app$/, /\.netlify\.app$/, /\.surge\.sh$/], // Allow multiple origins including common deployment platforms
     credentials: true,
     methods: ['GET', 'POST'],
     allowedHeaders: ['Content-Type', 'Authorization']
@@ -33,7 +33,7 @@ app.get('/downloads/:filename', (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000');
+    res.setHeader('Access-Control-Allow-Origin', '*'); // Allow all origins for file downloads
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     
     // Determine content type based on file extension
