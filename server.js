@@ -12,6 +12,37 @@ const pipeline = promisify(stream.pipeline);
 // Set environment variable to disable update check
 process.env.YTDL_NO_UPDATE = '1';
 
+// Simple rate limiting to avoid overwhelming YouTube
+const requestQueue = [];
+let isProcessing = false;
+
+const processQueue = async () => {
+    if (isProcessing || requestQueue.length === 0) return;
+    
+    isProcessing = true;
+    
+    while (requestQueue.length > 0) {
+        const { resolve, reject, fn } = requestQueue.shift();
+        try {
+            const result = await fn();
+            resolve(result);
+        } catch (error) {
+            reject(error);
+        }
+        // Add delay between requests
+        await new Promise(r => setTimeout(r, 2000));
+    }
+    
+    isProcessing = false;
+};
+
+const queueRequest = (fn) => {
+    return new Promise((resolve, reject) => {
+        requestQueue.push({ resolve, reject, fn });
+        processQueue();
+    });
+};
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -86,12 +117,34 @@ const formatFileSize = (bytes) => {
 
 // Helper function to get video info with fallback
 const getVideoInfoWithFallback = async (url, options) => {
+    // Add random delay to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, Math.random() * 2000 + 500));
+    
     try {
         return await ytdl.getInfo(url, options);
     } catch (error) {
         console.log('Primary ytdl failed, trying fallback:', error.message);
+        
+        // Add another delay before fallback
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
         // Try with fallback library (simpler options)
-        return await ytdlFallback.getInfo(url);
+        try {
+            return await ytdlFallback.getInfo(url, {
+                requestOptions: {
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Cookie': '',
+                        'Referer': 'https://www.youtube.com/'
+                    }
+                }
+            });
+        } catch (fallbackError) {
+            console.log('Fallback also failed:', fallbackError.message);
+            throw fallbackError;
+        }
     }
 };
 
@@ -108,74 +161,68 @@ app.post('/api/video-info', async (req, res) => {
 
         console.log('Getting video info...');
         
-        // Retry mechanism for getting video info
-        let info;
-        let attempts = 0;
-        const maxAttempts = 3;
-        
-        while (attempts < maxAttempts) {
-            try {
-                info = await ytdl.getInfo(url, {
-                    requestOptions: {
-                        headers: {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-                            'Accept-Language': 'en-US,en;q=0.9',
-                            'Accept-Encoding': 'gzip, deflate, br',
-                            'DNT': '1',
-                            'Connection': 'keep-alive',
-                            'Upgrade-Insecure-Requests': '1',
-                            'Sec-Fetch-Dest': 'document',
-                            'Sec-Fetch-Mode': 'navigate',
-                            'Sec-Fetch-Site': 'none',
-                            'Cache-Control': 'max-age=0'
+        // Use queue to rate limit requests
+        const info = await queueRequest(async () => {
+            // Retry mechanism for getting video info
+            let attempts = 0;
+            const maxAttempts = 3;
+            
+            while (attempts < maxAttempts) {
+                try {
+                    return await ytdl.getInfo(url, {
+                        requestOptions: {
+                            headers: {
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                                'Accept-Language': 'en-US,en;q=0.9',
+                                'Accept-Encoding': 'gzip, deflate, br',
+                                'DNT': '1',
+                                'Connection': 'keep-alive',
+                                'Upgrade-Insecure-Requests': '1',
+                                'Sec-Fetch-Dest': 'document',
+                                'Sec-Fetch-Mode': 'navigate',
+                                'Sec-Fetch-Site': 'cross-site',
+                                'Cache-Control': 'max-age=0',
+                                'Referer': 'https://www.youtube.com/'
+                            },
+                            transform: (parsed) => {
+                                parsed.rejectUnauthorized = false;
+                                return parsed;
+                            }
                         },
-                        transform: (parsed) => {
-                            parsed.rejectUnauthorized = false;
-                            return parsed;
+                        agent: false,
+                        lang: 'en',
+                        format: 'html5'
+                    });
+                } catch (error) {
+                    attempts++;
+                    console.log(`Attempt ${attempts} failed:`, error.message);
+                    
+                    if (attempts >= maxAttempts) {
+                        // Try fallback with regular ytdl-core
+                        console.log('Trying fallback with ytdl-core...');
+                        try {
+                            const result = await ytdlFallback.getInfo(url);
+                            console.log('Fallback successful!');
+                            return result;
+                        } catch (fallbackError) {
+                            console.log('Fallback also failed:', fallbackError.message);
+                            throw error; // Throw original error
                         }
-                    },
-                    agent: false,
-                    lang: 'en',
-                    format: 'html5'
-                });
-                break; // Success, exit retry loop
-            } catch (error) {
-                attempts++;
-                console.log(`Attempt ${attempts} failed:`, error.message);
-                
-                if (attempts >= maxAttempts) {
-                    // Try fallback with regular ytdl-core
-                    console.log('Trying fallback with ytdl-core...');
-                    try {
-                        info = await ytdlFallback.getInfo(url);
-                        console.log('Fallback successful!');
-                        break;
-                    } catch (fallbackError) {
-                        console.log('Fallback also failed:', fallbackError.message);
-                        
-                        // If all retries failed, check if it's a specific error
-                        if (error.message.includes('Video unavailable') || fallbackError.message.includes('Video unavailable')) {
-                            return res.status(400).json({ 
-                                error: 'This video is not available for download. It may be private, age-restricted, or region-blocked.',
-                                details: 'Please try with a different video URL.'
-                            });
-                        }
-                        
-                        if (error.message.includes('parsing watch.html') || fallbackError.message.includes('parsing')) {
-                            return res.status(503).json({ 
-                                error: 'YouTube has made changes that temporarily prevent downloads. Please try again later.',
-                                details: 'This is a temporary issue that should be resolved soon.'
-                            });
-                        }
-                        
-                        throw error; // Re-throw other errors
                     }
+                    
+                    // Wait before retry
+                    await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
                 }
-                
-                // Wait before retry
-                await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
             }
+        });
+        
+        // Check for specific error types and provide user-friendly messages
+        if (!info) {
+            return res.status(503).json({ 
+                error: 'YouTube has made changes that temporarily prevent downloads. Please try again later.',
+                details: 'This is a temporary issue that should be resolved soon.'
+            });
         }
         
         const videoDetails = info.videoDetails;
